@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>ムードフォト</title>
-<meta name="description" content="写真を入れるだけで、おしゃれな雰囲気に。フィルター・切り抜き・フレーム・文字入れができる無料の写真加工アプリ。写真は端末の中だけで処理されます。">
+<meta name="description" content="写真を入れるだけで、おしゃれな雰囲気に。フィルター・イラスト風の線画・切り抜き・フレーム・文字入れができる無料の写真加工アプリ。写真は端末の中だけで処理されます。">
 <meta name="theme-color" content="#141312">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -111,6 +111,7 @@ textarea,input[type=text]{width:100%;background:var(--panel2);border:1px solid v
     <aside class="off" id="side">
       <nav class="tabs" id="tabs">
         <button data-t="preset" class="on">プリセット</button>
+        <button data-t="line">線画</button>
         <button data-t="adjust">調整</button>
         <button data-t="crop">切り抜き</button>
         <button data-t="frame">フレーム</button>
@@ -122,6 +123,14 @@ textarea,input[type=text]{width:100%;background:var(--panel2);border:1px solid v
           <div class="lab"><span>かかり具合</span><span id="strengthV">100</span></div>
           <input type="range" id="strength" min="0" max="100" value="100">
         </div>
+      </div>
+      <div class="pane" data-p="line">
+        <div class="h">スタイル</div>
+        <div class="chips" id="lines"></div>
+        <div class="h">AI</div>
+        <label class="check"><input type="checkbox" id="bgOff">背景を消して、人物だけ線画にする</label>
+        <div id="lineSliders"></div>
+        <p class="hint">写真をイラストのような線画にします。「背景を消す」は端末の中のAIで人物を見つけます（初回だけAIを読み込みます。写真は送信されません）。</p>
       </div>
       <div class="pane" data-p="adjust">
         <div id="sliders"></div>
@@ -217,6 +226,14 @@ const FONTS = [
   {f:'Caveat',w:600,name:'Handwriting'},{f:'Cormorant Garamond',w:600,name:'Classic',italic:true},
 ];
 const COLORS = ['#ffffff','#2b2622','#f3d9b5','#e8a7a0','#a9c4d6','#ff9a3c'];
+const LINES = [
+  {id:'none',name:'なし'},{id:'pen',name:'ペン画'},{id:'wash',name:'淡彩（うすい色）'},
+  {id:'manga',name:'マンガ'},{id:'pencil',name:'えんぴつ'},
+];
+const LSLIDERS = [
+  {k:'lAmt',  name:'線の量'},{k:'lThick',name:'線の太さ'},
+  {k:'lDark', name:'黒ベタ（髪など）'},{k:'lColor',name:'色の濃さ（淡彩）'},
+];
 const TPOS = [{id:'top',name:'上'},{id:'center',name:'まんなか'},{id:'bottom',name:'下'}];
 
 /* ---------- 状態 ---------- */
@@ -224,6 +241,7 @@ const S = {
   img:null, fileDate:new Date(), preset:'orig', strength:1, adj:{},
   ratio:'orig', zoom:1, cx:.5, cy:.5, frame:'none',
   text:'', font:0, color:'#ffffff', tpos:'bottom', tsize:6, dateOn:false, dateTxt:'',
+  line:'none', bgOff:false, lAmt:50, lThick:40, lDark:35, lColor:50,
   original:false,
 };
 const resetAdj = () => SLIDERS.forEach(s => S.adj[s.k] = 0);
@@ -292,6 +310,157 @@ function applyFilter(id, w, h, P, gk){
   }
 }
 
+/* ---------- 線画 ---------- */
+// ガウスぼかし（ボックスぼかし3回で近似）
+function gaussBoxes(sigma){
+  const n = 3, wi = Math.sqrt(12*sigma*sigma/n+1);
+  let wl = Math.floor(wi); if (wl%2===0) wl--;
+  const m = Math.round((12*sigma*sigma - n*wl*wl - 4*n*wl - 3*n)/(-4*wl-4));
+  return [0,1,2].map(i => ((i<m?wl:wl+2)-1)/2);
+}
+function boxPass(s, t, w, h, r, vert){
+  if (r<1){ t.set(s); return; }
+  const inv = 1/(2*r+1), N = vert?h:w, M = vert?w:h, st = vert?w:1, ln = vert?1:w;
+  for (let j=0;j<M;j++){
+    const o = j*ln; let acc = 0;
+    for (let k=-r-1;k<r;k++) acc += s[o+Math.min(N-1,Math.max(0,k))*st];
+    for (let i=0;i<N;i++){
+      acc += s[o+Math.min(N-1,i+r)*st] - s[o+Math.max(0,i-r-1)*st];
+      t[o+i*st] = acc*inv;
+    }
+  }
+}
+function blurF(src, w, h, sigma){
+  const a = new Float32Array(src), b = new Float32Array(src.length);
+  for (const r of gaussBoxes(Math.max(.3,sigma))){ boxPass(a,b,w,h,r,false); boxPass(b,a,w,h,r,true); }
+  return a;
+}
+const smooth = (a,b,v) => { const t = Math.min(1,Math.max(0,(v-a)/(b-a))); return t*t*(3-2*t); };
+
+function lineArt(id, w, h, mask){
+  const d = id.data, n = w*h, u = Math.max(w,h)/1000, st = S.line;
+  // 明るさ（1%〜99%で伸ばして、暗い写真・明るい写真の差をならす）
+  const gray = new Float32Array(n), hist = new Uint32Array(256);
+  for (let i=0,j=0;i<n;i++,j+=4){ const v = (.299*d[j]+.587*d[j+1]+.114*d[j+2])|0; gray[i] = v; hist[v]++; }
+  let lo = 0, hi = 255, acc = 0;
+  for (let v=0;v<256;v++){ acc += hist[v]; if (acc < n*.01) lo = v; if (acc <= n*.99) hi = v; }
+  const span = Math.max(30, hi-lo);
+  for (let i=0;i<n;i++) gray[i] = Math.min(1, Math.max(0, (gray[i]-lo)/span));
+
+  const sig = (.5 + S.lThick/100*2.2)*u;
+  const pre = blurF(gray, w, h, u*.8);           // 細かいノイズを先に消す
+  const g1 = blurF(pre, w, h, sig), g2 = blurF(pre, w, h, sig*1.7);
+  const gs = blurF(gray, w, h, u*2.5);           // 黒ベタ・トーン用のなめらかな明るさ
+  // 周りのコントラストで線の強さをならす（顔の輪郭など淡い線を拾い、服のしわは出すぎない）
+  const sq = new Float32Array(n); for (let i=0;i<n;i++) sq[i] = pre[i]*pre[i];
+  const m1 = blurF(pre, w, h, u*12), m2 = blurF(sq, w, h, u*12);
+  const t = .05 - S.lAmt/100*.044;               // 線の出やすさ
+  const dk = S.lDark/100*.42;                    // この明るさより暗いところを塗りつぶす
+
+  // 人物の輪郭線（マスクの境目）
+  const mb = mask ? blurF(mask, w, h, sig*1.3 + u) : null;
+  let col = null;
+  if (st==='wash'){
+    col = [0,1,2].map(c => { const a = new Float32Array(n); for (let i=0;i<n;i++) a[i] = d[i*4+c]/255; return blurF(a,w,h,u*3); });
+  }
+  const paper = st==='pencil' ? [.97,.955,.93] : [.985,.98,.97];
+  const ink = st==='pencil' ? [.22,.21,.2] : [.07,.065,.06];
+  const ca = S.lColor/100;
+  const per = Math.max(3, 5*u), cs = Math.SQRT1_2;   // マンガのトーン（45°の網点）
+
+  for (let y=0,i=0;y<h;y++){
+    for (let x=0;x<w;x++,i++){
+      const sd = Math.sqrt(Math.max(0, m2[i]-m1[i]*m1[i]));
+      const e = (g2[i]-g1[i]) * Math.min(3, .22/(sd+.05)); // 暗い側の輪郭でプラスになる
+      let k = smooth(t, t*1.9+.004, e);
+      if (st==='pencil'){
+        k = smooth(t*.5, t*2.4+.01, e)*.85;
+        k = Math.max(k, smooth(.62, .25, gs[i])*.28);           // 暗いところにうすい影
+        k *= .8 + .4*hash(x, (y/3)|0);                          // 紙の目
+      }
+      if (dk>0) k = Math.max(k, smooth(dk, dk-.07, gs[i]));
+      const pm = mask ? smooth(.3, .7, mask[i]) : 1;   // 人物らしさ（背景は0）
+      if (st==='manga' && gs[i] < dk+.3){
+        const dark = smooth(dk+.3, dk+.02, gs[i]);
+        const X = (x+y)*cs/per, Y = (x-y)*cs/per;
+        const fx = X-Math.floor(X)-.5, fy = Y-Math.floor(Y)-.5;
+        const rr = Math.sqrt(dark)*.42;
+        k = Math.max(k, smooth(rr*rr+.012, rr*rr-.012, fx*fx+fy*fy));
+      }
+      if (mask){
+        k *= pm;
+        const ol = smooth(.55, .9, 1-Math.abs(mb[i]-.5)*2.2);
+        k = Math.max(k, ol*(st==='pencil'?.75:.95));
+      }
+      let r = paper[0], g = paper[1], b = paper[2];
+      if (col && pm>0){
+        // 色を少しだけ鮮やかに → 白に寄せて、淡い水彩っぽく
+        let cr = col[0][i], cg = col[1][i], cb = col[2][i];
+        const l = .299*cr+.587*cg+.114*cb;
+        cr = l+(cr-l)*1.5; cg = l+(cg-l)*1.5; cb = l+(cb-l)*1.5;
+        const a = ca*.75*(.55+.45*smooth(.15,.6,l))*pm;
+        r = paper[0]-(paper[0]-cr)*a; g = paper[1]-(paper[1]-cg)*a; b = paper[2]-(paper[2]-cb)*a;
+      }
+      const j = i*4;
+      d[j]   = Math.min(255,Math.max(0,(r+(ink[0]-r)*k)*255));
+      d[j+1] = Math.min(255,Math.max(0,(g+(ink[1]-g)*k)*255));
+      d[j+2] = Math.min(255,Math.max(0,(b+(ink[2]-b)*k)*255));
+    }
+  }
+}
+/* 人物の切り抜き（MediaPipe・端末内で実行） */
+let segmenter = null, segLoading = null, segMask = null; // segMask = {img, canvas}
+async function loadSegmenter(){
+  if (segmenter) return segmenter;
+  if (!segLoading) segLoading = (async () => {
+    const V = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+    const fs = await V.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const opt = d => ({baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite', delegate:d},
+      runningMode:'IMAGE', outputConfidenceMasks:true, outputCategoryMask:false});
+    try { segmenter = await V.ImageSegmenter.createFromOptions(fs, opt('GPU')); }
+    catch(e){ segmenter = await V.ImageSegmenter.createFromOptions(fs, opt('CPU')); }
+    return segmenter;
+  })().catch(e => { segLoading = null; throw e; });
+  return segLoading;
+}
+async function ensureMask(){
+  if (segMask && segMask.img===S.img) return;
+  const seg = await loadSegmenter();
+  const img = S.img, sc = Math.min(1, 1024/Math.max(img.width,img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width*sc); c.height = Math.round(img.height*sc);
+  c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+  const res = seg.segment(c), m = res.confidenceMasks[0];
+  const f = m.getAsFloat32Array(), mw = m.width, mh = m.height;
+  const mc = document.createElement('canvas'); mc.width = mw; mc.height = mh;
+  const mx = mc.getContext('2d'), md = mx.createImageData(mw, mh);
+  for (let i=0;i<f.length;i++){ const v = f[i]*255; md.data[i*4]=md.data[i*4+1]=md.data[i*4+2]=v; md.data[i*4+3]=255; }
+  mx.putImageData(md,0,0);
+  res.close && res.close();
+  segMask = {img, canvas:mc};
+}
+function cropMask(r, pw, ph){
+  if (!S.bgOff || !segMask || segMask.img!==S.img) return null;
+  const mc = segMask.canvas, kx = mc.width/r.iw, ky = mc.height/r.ih;
+  const c = document.createElement('canvas'); c.width = pw; c.height = ph;
+  const x = c.getContext('2d'); x.imageSmoothingQuality = 'high';
+  x.drawImage(mc, r.sx*kx, r.sy*ky, r.sw*kx, r.sh*ky, 0, 0, pw, ph);
+  const d = x.getImageData(0,0,pw,ph).data, a = new Float32Array(pw*ph);
+  for (let i=0;i<a.length;i++) a[i] = d[i*4]/255;
+  return a;
+}
+
+let lineCache = null;
+function lineArtCached(x, r, pw, ph){
+  const mask = cropMask(r, pw, ph);
+  const key = [r.sx,r.sy,r.sw,r.sh,pw,ph,S.line,S.lAmt,S.lThick,S.lDark,S.lColor,!!mask].join('|');
+  if (lineCache && lineCache.img===S.img && lineCache.key===key) return lineCache.id;
+  const id = x.getImageData(0,0,pw,ph);
+  lineArt(id, pw, ph, mask);
+  lineCache = {img:S.img, key, id};
+  return id;
+}
+
 let meta = null; // 直近のプレビューの切り抜き情報（ドラッグ用）
 function cropRect(){
   const iw = S.img.width, ih = S.img.height, ar = RATIOS.find(r => r.id === S.ratio).v;
@@ -302,6 +471,7 @@ function cropRect(){
 }
 
 function render(maxSide){
+  if (S.line!=='none') maxSide = Math.min(maxSide, 2400); // 線画は重いので上限
   const r = cropRect();
   const sc = Math.min(1, maxSide/Math.max(r.sw, r.sh));
   const pw = Math.max(1,Math.round(r.sw*sc)), ph = Math.max(1,Math.round(r.sh*sc));
@@ -309,6 +479,7 @@ function render(maxSide){
   const x = pc.getContext('2d', {willReadFrequently:true});
   x.imageSmoothingQuality = 'high';
   x.drawImage(S.img, r.sx, r.sy, r.sw, r.sh, 0, 0, pw, ph);
+  if (!S.original && S.line!=='none') x.putImageData(lineArtCached(x, r, pw, ph), 0, 0);
   if (!S.original && (S.preset!=='orig' || SLIDERS.some(s => S.adj[s.k]))){
     const id = x.getImageData(0,0,pw,ph);
     applyFilter(id, pw, ph, params(), Math.max(1, Math.round(Math.max(pw,ph)/1000)));
@@ -447,7 +618,10 @@ async function loadFile(file){
   $('#stageTools').style.display = 'flex';
   $('#side').classList.remove('off');
   $('#saveBtn').disabled = false; $('#resetAll').disabled = false; $('#newBtn').hidden = false;
-  makeThumbs(); draw();
+  makeThumbs(); draw(); refreshMask();
+}
+function refreshMask(){
+  if (S.bgOff) ensureMask().then(draw).catch(() => {});
 }
 function fmtDate(d){
   const p = n => String(n).padStart(2,'0');
@@ -497,6 +671,25 @@ function chips(el, list, key, onPick){
 function sync(el, list, key){
   [...el.children].forEach((c,i) => c.classList.toggle('on', key==='font' ? i===S.font : list[i].id===S[key]));
 }
+chips($('#lines'), LINES, 'line', it => S.line = it.id);
+$('#lineSliders').innerHTML = LSLIDERS.map(s => `
+  <div class="row"><div class="lab"><span>${s.name}</span><span id="v_${s.k}">${S[s.k]}</span></div>
+  <input type="range" data-k="${s.k}" min="0" max="100" value="${S[s.k]}"></div>`).join('');
+$('#lineSliders').querySelectorAll('input').forEach(inp => inp.oninput = () => {
+  S[inp.dataset.k] = +inp.value; $('#v_'+inp.dataset.k).textContent = inp.value;
+  if (S.line==='none'){ S.line = 'pen'; sync($('#lines'), LINES, 'line'); }
+  draw();
+});
+$('#bgOff').onchange = async e => {
+  S.bgOff = e.target.checked;
+  if (S.bgOff && S.line==='none'){ S.line = 'pen'; sync($('#lines'), LINES, 'line'); }
+  if (S.bgOff && S.img && !(segMask && segMask.img===S.img)){
+    toast('AIで人物をさがしています…');
+    try { await ensureMask(); }
+    catch(err){ console.error(err); S.bgOff = false; e.target.checked = false; toast('AIを読み込めませんでした（ネット接続を確認してください）'); }
+  }
+  draw();
+};
 chips($('#ratios'), RATIOS, 'ratio', it => { S.ratio = it.id; S.cx = S.cy = .5; });
 chips($('#frames'), FRAMES, 'frame', it => S.frame = it.id);
 chips($('#tpos'), TPOS, 'tpos', it => S.tpos = it.id);
@@ -526,7 +719,7 @@ function transform(rot){
   c.width = rot ? s.height : s.width; c.height = rot ? s.width : s.height;
   const x = c.getContext('2d');
   if (rot){ x.translate(c.width,0); x.rotate(Math.PI/2); } else { x.translate(c.width,0); x.scale(-1,1); }
-  x.drawImage(s,0,0); S.img = c; S.cx = S.cy = .5; makeThumbs(); draw();
+  x.drawImage(s,0,0); S.img = c; S.cx = S.cy = .5; makeThumbs(); draw(); refreshMask();
 }
 $('#rotBtn').onclick = () => S.img && transform(true);
 $('#flipBtn').onclick = () => S.img && transform(false);
@@ -561,12 +754,13 @@ $('#luckyBtn').onclick = () => {
 };
 
 $('#resetAll').onclick = () => {
-  Object.assign(S, {preset:'orig', strength:1, ratio:'orig', zoom:1, cx:.5, cy:.5, frame:'none', text:'', dateOn:false});
+  Object.assign(S, {preset:'orig', strength:1, ratio:'orig', zoom:1, cx:.5, cy:.5, frame:'none', text:'', dateOn:false, line:'none', bgOff:false});
+  $('#bgOff').checked = false;
   resetAdj(); buildSliders(); syncPresets();
   $('#strength').value = 100; $('#strengthV').textContent = 100;
   $('#zoom').value = 100; $('#zoomV').textContent = '1.0x';
   $('#txt').value = ''; $('#dateOn').checked = false;
-  sync($('#ratios'), RATIOS, 'ratio'); sync($('#frames'), FRAMES, 'frame');
+  sync($('#ratios'), RATIOS, 'ratio'); sync($('#frames'), FRAMES, 'frame'); sync($('#lines'), LINES, 'line');
   draw();
 };
 
